@@ -61,7 +61,10 @@ Dans **Settings → Secrets and variables → Actions**, ajoute :
 | `KEYSTORE_PASSWORD` | mot de passe du keystore |
 | `KEYSTORE_ENTRY_ALIAS` | alias de la clé |
 | `KEYSTORE_ENTRY_PASSWORD` | mot de passe de la clé |
-| `GH_PACKAGES_TOKEN` | token GitHub (classic) avec le scope `read:packages`, pour télécharger les bibliothèques ReVanced |
+
+Les bibliothèques ReVanced (GitHub Packages) se téléchargent avec le token fourni
+automatiquement au workflow. Si GitHub le refuse un jour, ajoute un secret
+`GH_PACKAGES_TOKEN` (token classic avec `read:packages`).
 
 Créer le keystore (à garder précieusement : sans lui, impossible de publier une mise à
 jour installable par-dessus la précédente) :
@@ -73,7 +76,9 @@ base64 -w 0 keystore.jks   # valeur du secret KEYSTORE
 
 Ensuite, lance le workflow une première fois depuis l'onglet **Actions**
 (**Build ReVanced Manager Bundle → Run workflow**). L'option `dry_run` construit l'APK
-sans publier de release.
+sans publier de release (signé avec une clé de debug si `KEYSTORE` est absent). Un push
+qui modifie `patches/`, `scripts/`, `config.env` ou le workflow lance aussi un build de
+test.
 
 GitHub désactive les workflows planifiés d'un dépôt sans activité depuis 60 jours : il
 suffit alors de le réactiver depuis l'onglet **Actions**.
