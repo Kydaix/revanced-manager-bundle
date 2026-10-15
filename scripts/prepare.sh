@@ -33,6 +33,20 @@ for patch in "$ROOT"/patches/*.patch; do
     echo "OK (3-way) : $name"
 done
 
+# ARSCLib embarque ses propres copies de org.xmlpull et de deux classes android.*,
+# déjà fournies par d'autres dépendances de Manager (et par Android) : on les retire,
+# sinon checkReleaseDuplicateClasses échoue.
+mkdir -p app/libs
+arsclib=app/libs/arsclib.jar
+curl -fsSL -o "$arsclib" \
+    "https://repo1.maven.org/maven2/io/github/reandroid/ARSCLib/$ARSCLIB_VERSION/ARSCLib-$ARSCLIB_VERSION.jar"
+echo "$ARSCLIB_SHA256  $arsclib" | sha256sum --check --quiet || {
+    echo "::error::Empreinte SHA-256 inattendue pour ARSCLib $ARSCLIB_VERSION" >&2
+    exit 1
+}
+zip -q -d "$arsclib" 'android/*' 'org/xmlpull/*'
+echo "ARSCLib $ARSCLIB_VERSION ajouté (sans org.xmlpull ni android.*)"
+
 # Identité de l'application.
 gradle_file=app/build.gradle.kts
 sed -i -E "s/applicationId = \"[^\"]+\"/applicationId = \"$APPLICATION_ID\"/" "$gradle_file"

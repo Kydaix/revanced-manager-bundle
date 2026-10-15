@@ -1,13 +1,14 @@
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index def49f0..d5bc23f 100644
+index def49f0..d91a724 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
-@@ -19,6 +19,9 @@ plugins {
+@@ -19,6 +19,10 @@ plugins {
  val outputApkFileName = "${rootProject.name}-$version.apk"
  
  dependencies {
 +    // Fusion des APK splittés (SplitApkMerger)
-+    implementation("io.github.reandroid:ARSCLib:1.4.0")
++    // ARSCLib sans ses copies de org.xmlpull et android.* (déjà fournies) : voir scripts/prepare.sh
++    implementation(files("libs/arsclib.jar"))
 +
      // AndroidX Core
      implementation(libs.androidx.ktx)
