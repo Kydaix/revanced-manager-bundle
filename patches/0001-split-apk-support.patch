@@ -1,0 +1,194 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index def49f0..d5bc23f 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -19,6 +19,9 @@ plugins {
+ val outputApkFileName = "${rootProject.name}-$version.apk"
+ 
+ dependencies {
++    // Fusion des APK splittés (SplitApkMerger)
++    implementation("io.github.reandroid:ARSCLib:1.4.0")
++
+     // AndroidX Core
+     implementation(libs.androidx.ktx)
+     implementation(libs.runtime.ktx)
+diff --git a/app/src/main/java/app/revanced/manager/domain/repository/ManagerUpdateRepository.kt b/app/src/main/java/app/revanced/manager/domain/repository/ManagerUpdateRepository.kt
+index 0edc343..c2abead 100644
+--- a/app/src/main/java/app/revanced/manager/domain/repository/ManagerUpdateRepository.kt
++++ b/app/src/main/java/app/revanced/manager/domain/repository/ManagerUpdateRepository.kt
+@@ -25,7 +25,8 @@ class ManagerUpdateRepository(
+ 
+         _releasedAt.value = update.createdAt
+         _version.value = update.version
+-        _hasUpdate.value = update.version.removePrefix("v") != BuildConfig.VERSION_NAME
++        // Build modifiée (signature différente) : la version officielle ne peut pas la mettre à jour.
++        _hasUpdate.value = false
+ 
+         return update
+     }
+diff --git a/app/src/main/java/app/revanced/manager/patcher/worker/PatcherWorker.kt b/app/src/main/java/app/revanced/manager/patcher/worker/PatcherWorker.kt
+index 0c9066b..767c1dc 100644
+--- a/app/src/main/java/app/revanced/manager/patcher/worker/PatcherWorker.kt
++++ b/app/src/main/java/app/revanced/manager/patcher/worker/PatcherWorker.kt
+@@ -241,7 +241,8 @@ class PatcherWorker(
+                         ?: throw IllegalStateException("Package ${selectedApp.packageName} is not installed.")
+                     val appInfo = pkgInfo.applicationInfo
+                         ?: throw IllegalStateException("Failed to retrieve application info for ${selectedApp.packageName}.")
+-                    File(appInfo.sourceDir)
++                    // Fusionne base.apk et ses splits si l'app vient d'un bundle.
++                    app.revanced.manager.util.SplitApkMerger.sourceFor(appInfo, fs.tempDir)
+                 }
+             }
+ 
+@@ -294,6 +295,7 @@ class PatcherWorker(
+             Result.failure()
+         } finally {
+             patchedApk.delete()
++            fs.tempDir.resolve(app.revanced.manager.util.SplitApkMerger.MERGED_APK_NAME).delete()
+             if (!success) {
+                 File(args.output).delete()
+             }
+diff --git a/app/src/main/java/app/revanced/manager/ui/viewmodel/SelectedAppInfoViewModel.kt b/app/src/main/java/app/revanced/manager/ui/viewmodel/SelectedAppInfoViewModel.kt
+index 2ed8f29..4a1532a 100644
+--- a/app/src/main/java/app/revanced/manager/ui/viewmodel/SelectedAppInfoViewModel.kt
++++ b/app/src/main/java/app/revanced/manager/ui/viewmodel/SelectedAppInfoViewModel.kt
+@@ -122,8 +122,7 @@ class SelectedAppInfoViewModel(
+ 
+             installedAppData =
+                 packageInfo.await()?.let {
+-                    // Split APKs cannot be used as a patch source.
+-                    if (it.isSplitApk()) return@let null
++                    // Les apps installées en APK splittés sont fusionnées avant le patch (SplitApkMerger).
+                     SelectedApp.Installed(
+                         packageName,
+                         it.versionName ?: error("App version field not set")
+diff --git a/app/src/main/java/app/revanced/manager/util/SplitApkMerger.kt b/app/src/main/java/app/revanced/manager/util/SplitApkMerger.kt
+new file mode 100644
+index 0000000..9b95852
+--- /dev/null
++++ b/app/src/main/java/app/revanced/manager/util/SplitApkMerger.kt
+@@ -0,0 +1,124 @@
++package app.revanced.manager.util
++
++import android.content.pm.ApplicationInfo
++import android.util.Log
++import com.reandroid.apk.APKLogger
++import com.reandroid.apk.ApkBundle
++import com.reandroid.apk.ApkModule
++import com.reandroid.arsc.chunk.xml.ResXmlElement
++import java.io.File
++
++/**
++ * Fusionne une application installée en APK splittés (bundle du Play Store) en un APK
++ * unique, utilisable comme source de patch.
++ *
++ * La fusion repose sur ARSCLib (bibliothèque d'APKEditor) : ressources, dex et
++ * bibliothèques natives des splits sont regroupés dans le module de base, puis les
++ * déclarations propres aux splits sont retirées du manifeste pour que l'APK obtenu
++ * puisse s'installer seul.
++ */
++object SplitApkMerger {
++    const val MERGED_APK_NAME = "merged-source.apk"
++
++    // Identifiants des attributs android:* (android.R.attr), en dur car certains
++    // n'existent qu'à partir d'API récentes.
++    private const val ATTR_NAME = 0x01010003
++    private const val ATTR_IS_SPLIT_REQUIRED = 0x01010591
++    private const val ATTR_REQUIRED_SPLIT_TYPES = 0x0101064e
++    private const val ATTR_SPLIT_TYPES = 0x0101064f
++
++    private val signatureFiles = Regex("^META-INF/.+\\.(MF|SF|RSA|DSA|EC)$").toPattern()
++
++    /** Métadonnées ajoutées par le Play Store qui imposent la présence des splits. */
++    private val splitMetaData = setOf(
++        "com.android.vending.splits.required",
++        "com.android.vending.splits",
++        "com.android.vending.derived.apk.id",
++        "com.android.stamp.source",
++        "com.android.stamp.type",
++        "com.android.dynamic.apk.fused.modules",
++    )
++
++    fun ApplicationInfo.isSplit() = !splitSourceDirs.isNullOrEmpty()
++
++    /**
++     * Retourne l'APK à patcher pour une application installée : son base.apk s'il est
++     * autonome, sinon un APK fusionné écrit dans [outputDir].
++     */
++    fun sourceFor(appInfo: ApplicationInfo, outputDir: File): File {
++        if (!appInfo.isSplit()) return File(appInfo.sourceDir)
++
++        val apks = listOf(File(appInfo.sourceDir)) + appInfo.splitSourceDirs.orEmpty().map(::File)
++        return File(outputDir, MERGED_APK_NAME).also { merge(apks, it) }
++    }
++
++    /**
++     * Fusionne [apks] (le base.apk en premier, puis les splits) dans [output].
++     */
++    fun merge(apks: List<File>, output: File, logger: APKLogger = AndroidLogger) {
++        require(apks.isNotEmpty()) { "Aucun APK à fusionner" }
++        output.delete()
++
++        ApkBundle().use { bundle ->
++            bundle.setAPKLogger(logger)
++            apks.forEachIndexed { index, apk ->
++                // Le nom de module doit être unique ; « base » désigne le module principal.
++                val name = if (index == 0) "base" else apk.nameWithoutExtension
++                bundle.addModule(ApkModule.loadApkFile(apk, name).apply { setAPKLogger(logger) })
++            }
++
++            bundle.mergeModules(false).use { merged ->
++                // L'ancienne signature ne correspond plus au contenu fusionné.
++                merged.zipEntryMap.removeIf(signatureFiles)
++                merged.zipEntryMap.remove("stamp-cert-sha256")
++                merged.setApkSignatureBlock(null)
++                sanitizeManifest(merged)
++                merged.refreshTable()
++                merged.refreshManifest()
++                // Les bibliothèques natives ne sont plus dans un split dédié : on laisse
++                // Android les extraire à l'installation.
++                merged.setExtractNativeLibs(true)
++                merged.writeApk(output)
++            }
++        }
++
++        logger.logMessage("APK fusionné : ${output.absolutePath} (${apks.size} fichiers)")
++    }
++
++    private fun sanitizeManifest(module: ApkModule) {
++        if (!module.hasAndroidManifest()) return
++        val manifest = module.androidManifest
++
++        manifest.manifestElement?.apply {
++            removeAttributesWithId(ATTR_IS_SPLIT_REQUIRED)
++            removeAttributesWithId(ATTR_REQUIRED_SPLIT_TYPES)
++            removeAttributesWithId(ATTR_SPLIT_TYPES)
++            removeAttributesWithName("requiredSplitTypes")
++            removeAttributesWithName("splitTypes")
++        }
++
++        manifest.applicationElement?.apply {
++            removeAttributesWithId(ATTR_IS_SPLIT_REQUIRED)
++            removeElementsIf { element ->
++                element is ResXmlElement && element.name == "meta-data" &&
++                    element.searchAttributeByResourceId(ATTR_NAME)?.valueString in splitMetaData
++            }
++        }
++    }
++
++    private object AndroidLogger : APKLogger {
++        private const val TAG = "SplitApkMerger"
++
++        override fun logMessage(msg: String) {
++            Log.i(TAG, msg)
++        }
++
++        override fun logError(msg: String, tr: Throwable?) {
++            Log.e(TAG, msg, tr)
++        }
++
++        override fun logVerbose(msg: String) {
++            Log.v(TAG, msg)
++        }
++    }
++}

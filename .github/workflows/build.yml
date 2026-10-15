@@ -1,0 +1,184 @@
+name: Build ReVanced Manager Bundle
+
+# Surveille les releases officielles de ReVanced Manager. À chaque nouvelle version,
+# applique les modifications de ce dépôt, construit l'APK signé et publie une release
+# portant le même tag que la version officielle.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag officiel à construire (vide = dernière release)"
+        required: false
+        default: ""
+      force:
+        description: "Reconstruire même si la release existe déjà"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Construire sans publier (APK en artefact)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build-manager
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve upstream release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          source config.env
+
+          tag="${INPUT_TAG}"
+          if [[ -z "${tag}" ]]; then
+            # Les releases sont triées de la plus récente à la plus ancienne,
+            # pré-releases (dev) comprises.
+            tag="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=20" \
+              --jq '[.[] | select(.draft | not)][0].tag_name')"
+          fi
+          if [[ -z "${tag}" || "${tag}" == "null" ]]; then
+            echo "::error::Aucune release trouvée sur ${UPSTREAM_REPO}"
+            exit 1
+          fi
+
+          prerelease="$(gh api "repos/${UPSTREAM_REPO}/releases/tags/${tag}" --jq '.prerelease')"
+
+          build=true
+          if [[ "${FORCE}" != "true" && "${DRY_RUN}" != "true" ]] &&
+             gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            build=false
+            echo "La release ${tag} existe déjà, rien à faire."
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "prerelease=${prerelease}"
+            echo "build=${build}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Clone upstream
+        if: steps.release.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          source config.env
+          git clone --quiet --depth 1 --branch "${TAG}" "https://github.com/${UPSTREAM_REPO}" upstream
+
+      - name: Apply modifications
+        if: steps.release.outputs.build == 'true'
+        run: scripts/prepare.sh "${GITHUB_WORKSPACE}/upstream"
+
+      - name: Set up JDK
+        if: steps.release.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up keystore
+        if: steps.release.outputs.build == 'true'
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+        run: |
+          # Sans keystore fixe, chaque build serait signée avec une clé différente et
+          # ne pourrait pas mettre à jour la précédente.
+          if [[ -z "${KEYSTORE}" ]]; then
+            echo "::error::Secret KEYSTORE manquant. Voir la section « Configuration » du README."
+            exit 1
+          fi
+          echo "${KEYSTORE}" | base64 --decode > upstream/app/keystore.jks
+
+      - name: Build APK
+        if: steps.release.outputs.build == 'true'
+        working-directory: upstream
+        env:
+          ORG_GRADLE_PROJECT_githubPackagesUsername: ${{ secrets.GH_PACKAGES_USERNAME || github.actor }}
+          ORG_GRADLE_PROJECT_githubPackagesPassword: ${{ secrets.GH_PACKAGES_TOKEN || github.token }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ENTRY_ALIAS: ${{ secrets.KEYSTORE_ENTRY_ALIAS }}
+          KEYSTORE_ENTRY_PASSWORD: ${{ secrets.KEYSTORE_ENTRY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Collect APK
+        if: steps.release.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          apk="$(find upstream/app/build/outputs/apk/release -maxdepth 1 -name '*.apk' | head -n 1)"
+          test -n "${apk}"
+          mkdir -p dist
+          cp "${apk}" "dist/revanced-manager-bundle-${TAG}.apk"
+          cp "${apk}" "dist/revanced-manager-bundle.apk"
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload artifact
+        if: steps.release.outputs.build == 'true' && inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: revanced-manager-bundle-${{ steps.release.outputs.tag }}
+          path: dist/*
+
+      - name: Publish release
+        if: steps.release.outputs.build == 'true' && !inputs.dry_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          source config.env
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+            exit 0
+          fi
+
+          flags=()
+          [[ "${PRERELEASE}" == "true" ]] && flags+=(--prerelease)
+
+          gh release create "${TAG}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${APP_NAME} ${TAG}" \
+            --notes "ReVanced Manager [${TAG}](https://github.com/${UPSTREAM_REPO}/releases/tag/${TAG}) avec la prise en charge des applications installées en APK splittés (bundles du Play Store). Voir le README pour les détails." \
+            "${flags[@]}"
+
+      - name: Report failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Échec du build pour ${TAG:-la dernière release}"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "in:title \"${title}\"" --json number --jq '.[0].number')"
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --repo "${GITHUB_REPOSITORY}" --body "Nouvel échec : ${RUN_URL}"
+          else
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" \
+              --body "Le build automatique a échoué : ${RUN_URL}
+
+          Cause la plus probable : la nouvelle version officielle a modifié le code ciblé par \`patches/\`. Il faut régénérer le patch (voir le README)."
+          fi
