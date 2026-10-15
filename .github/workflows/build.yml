@@ -4,6 +4,15 @@ name: Build ReVanced Manager Bundle
 # applique les modifications de ce dépôt, construit l'APK signé et publie une release
 # portant le même tag que la version officielle.
 on:
+  # Un push qui modifie le build lance un build de test (rien n'est publié).
+  push:
+    branches:
+      - main
+    paths:
+      - "patches/**"
+      - "scripts/**"
+      - "config.env"
+      - ".github/workflows/build.yml"
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
@@ -44,7 +53,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
           FORCE: ${{ inputs.force }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ inputs.dry_run || github.event_name == 'push' }}
         run: |
           set -euo pipefail
           source config.env
@@ -74,6 +83,7 @@ jobs:
             echo "tag=${tag}"
             echo "prerelease=${prerelease}"
             echo "build=${build}"
+            echo "dry_run=${DRY_RUN}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Clone upstream
@@ -99,7 +109,7 @@ jobs:
         if: steps.release.outputs.build == 'true'
         env:
           KEYSTORE: ${{ secrets.KEYSTORE }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ steps.release.outputs.dry_run }}
         run: |
           # Sans keystore fixe, chaque build serait signée avec une clé différente et
           # ne pourrait pas mettre à jour la précédente. Un dry run (non publié) peut
@@ -140,14 +150,14 @@ jobs:
           cat dist/SHA256SUMS.txt
 
       - name: Upload artifact
-        if: steps.release.outputs.build == 'true' && inputs.dry_run
+        if: steps.release.outputs.build == 'true' && steps.release.outputs.dry_run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: revanced-manager-bundle-${{ steps.release.outputs.tag }}
           path: dist/*
 
       - name: Publish release
-        if: steps.release.outputs.build == 'true' && !inputs.dry_run
+        if: steps.release.outputs.build == 'true' && steps.release.outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.release.outputs.tag }}
