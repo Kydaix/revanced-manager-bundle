@@ -99,9 +99,15 @@ jobs:
         if: steps.release.outputs.build == 'true'
         env:
           KEYSTORE: ${{ secrets.KEYSTORE }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # Sans keystore fixe, chaque build serait signée avec une clé différente et
-          # ne pourrait pas mettre à jour la précédente.
+          # ne pourrait pas mettre à jour la précédente. Un dry run (non publié) peut
+          # se contenter de la clé de debug.
+          if [[ -z "${KEYSTORE}" && "${DRY_RUN}" == "true" ]]; then
+            echo "::warning::Secret KEYSTORE absent : APK de test signé avec une clé de debug."
+            exit 0
+          fi
           if [[ -z "${KEYSTORE}" ]]; then
             echo "::error::Secret KEYSTORE manquant. Voir la section « Configuration » du README."
             exit 1
